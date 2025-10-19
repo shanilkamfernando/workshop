@@ -442,7 +442,13 @@ app.put("/entries/:id/driver", authenticateToken, async (req, res) => {
       `UPDATE data_entries
             SET purchase_date = $1, drivers_name = $2, vehicle_no = $3, received = NOW(), driver_description = $4
             WHERE id = $5`,
-      [purchase_date, drivers_name, vehicle_no, received, driver_description]
+      [
+        purchase_date,
+        drivers_name || null,
+        vehicle_no || null,
+        driver_description || null,
+        entryId,
+      ]
     );
 
     // Get the complete updated entry
