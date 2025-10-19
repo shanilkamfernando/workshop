@@ -427,6 +427,37 @@ app.put("/entries/:id/invoice", authenticateToken, async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
+
+//office --> step 5 - Drivers details
+app.put("/entries/:id/driver", authenticateToken, async (req, res) => {
+  if (req.user.role !== "office")
+    return res.status(403).json({ error: "Access Denied" });
+
+  const { purchase_date } = req.body;
+  const entryId = parseInt(req.params.id);
+
+  try {
+    // Simple update and return everything
+    await pool.query(
+      `UPDATE data_entries
+            SET purchase_date = $1, drivers_name = $2, vehicle_no = $3, received = NOW(), driver_description = $4
+            WHERE id = $5`,
+      [purchase_date, drivers_name, vehicle_no, received, driver_description]
+    );
+
+    // Get the complete updated entry
+    const result = await pool.query(
+      "SELECT * FROM data_entries WHERE id = $1",
+      [entryId]
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 // app.put("/entries/:id/invoice", authenticateToken, async (req, res) => {
 //   if(req.user.role !== "office") return res.status(403).json({error: "Access Denied"});
 
