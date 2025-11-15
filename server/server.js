@@ -4,10 +4,19 @@ import cors from "cors";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import pool from "./db.js"; // PostgreSQL pool
+import multer from "multer";
+import path from "path";
+import { fileURLToPath } from "url";
+import fs from "fs";
+import { log } from "console";
 
 dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Get __dirname equivalent in ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 //------------------------------middleware---------------------------------------------------
 app.use(
@@ -17,6 +26,44 @@ app.use(
 );
 
 app.use(express.json());
+
+// Serve static files
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+
+// Create uploads directory if it doesn't exist
+const uploadsDir = path.join(__dirname, "uploads", "partners");
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+// Configure multer for image uploads
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, uploadsDir);
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+    cb(null, "partner-" + uniqueSuffix + path.extname(file.originalname));
+  },
+});
+
+const upload = multer({
+  storage: storage,
+  limits: { fileSize: 2 * 1024 * 1024 }, // 2MB limit
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = /jpeg|jpg|png|gif/;
+    const extname = allowedTypes.test(
+      path.extname(file.originalname).toLowerCase()
+    );
+    const mimetype = allowedTypes.test(file.mimetype);
+
+    if (mimetype && extname) {
+      return cb(null, true);
+    } else {
+      cb(new Error("Only images are allowed"));
+    }
+  },
+});
 
 //---------------------------------JWT Auth Middleware------------------------------------------
 function authenticateToken(req, res, next) {
@@ -106,20 +153,262 @@ app.post("/login", async (req, res) => {
   }
 });
 
+//create partner
+app.post(
+  "/partners",
+  authenticateToken,
+  upload.single("image"),
+  async (req, res) => {
+    console.log("Create partner request received");
+    console.log("Body", req.body);
+    console.log("File:", req.file);
+
+    if (req.user.role !== "admin") {
+      return res.status(403).json({ error: "Only admin can create partners" });
+    }
+
+    const { name } = req.body;
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: "Partner name is required" });
+    }
+
+    try {
+      const imageUrl = req.file
+        ? `/uploads/partners/${req.file.filename}`
+        : null;
+
+      const result = await pool.query(
+        "INSERT INTO partners (name, image_url) VALUES ($1, $2) RETURNING id, name, image_url",
+        [name.trim(), imageUrl]
+      );
+
+      console.log("Partner Created", result.rows[0]);
+      res.json(result.rows[0]);
+    } catch (err) {
+      console.error("Error creating partner:", err);
+      res
+        .status(500)
+        .json({ error: "Error creating partner", details: err.message });
+    }
+  }
+);
+
+//delete a partner (admin only)
+app.delete("/partners/:id", authenticateToken, async (req, res) => {
+  if (req.user.role !== "admin") {
+    return res.status(403).json({ error: "Only admin can delete partners " });
+  }
+
+  const { id } = req.params;
+
+  try {
+    const projectCheck = await pool.query(
+      "SELECT COUNT(*) as count FROM projects WHERE partner_id = $1",
+      [id]
+    );
+
+    if (parseInt(projectCheck.rows[0].count) > 0) {
+      return res.status(400).json({
+        error:
+          "Cannot delete partner with existing projects. Delete projects first.",
+      });
+    }
+
+    //delete the partner
+    const result = await pool.query(
+      "DELETE FROM partners WHERE id = $1 RETURNING id, name",
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Partner not found" });
+    }
+    res.json({
+      message: "Partner deleted successfully",
+      deleted: result.rows[0],
+    });
+  } catch (err) {
+    console.error("Error deleting partner:", err);
+    res.status(500).json({ error: "Error deleting partner" });
+  }
+});
+
+//get all the partners
+app.get("/partners", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT id, name FROM partners ORDER BY id"
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("Error fetching partners:", err);
+    res.status(500).json({ error: "Error getting partners" });
+  }
+});
+
+//Optional ----> Get project info
+app.get("/projects/info/:projectId", authenticateToken, async (req, res) => {
+  const { projectId } = req.params;
+
+  console.log("Fetching project info for:", projectId);
+
+  try {
+    const result = await pool.query(
+      `SELECT p.id, p.name, p.partner_id, pa.name as partner_name
+       FROM projects p
+       JOIN partners pa ON p.partner_id = pa.id
+       WHERE p.id = $1`,
+      [projectId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Project not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("Error fetching project info:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/projects/:partnerId", authenticateToken, async (req, res) => {
+  const { partnerId } = req.params;
+
+  console.log("==== GET PROJECTS ======");
+  console.log("Partner ID:", partnerId);
+  console.log("User:", req.user.username);
+
+  try {
+    const result = await pool.query(
+      "SELECT id, name, partner_id FROM projects WHERE partner_id = $1 ORDER BY id",
+      [partnerId]
+    );
+
+    console.log("Projects found:", result.rows.length);
+    console.log("Projects:", result.rows);
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error("=== ERROR FETCHING PROJECTS ===");
+    console.error("Error message:", err.message);
+    console.error("Error code:", err.code);
+    console.error("Full error:", err);
+    res
+      .status(500)
+      .json({ error: "Error getting projects", details: err.message });
+  }
+});
+
+// Create a project under a partner (POST /projects) - admin only
+app.post("/projects", authenticateToken, async (req, res) => {
+  if (req.user.role !== "admin") {
+    return res.status(403).json({ error: "Only admin can create projects" });
+  }
+
+  const { name, partnerId } = req.body;
+  if (!name || !name.trim() || !partnerId) {
+    return res
+      .status(400)
+      .json({ error: "Project name and partnerId are required" });
+  }
+
+  try {
+    // ensure partner exists
+    const partnerCheck = await pool.query(
+      "SELECT id FROM partners WHERE id = $1",
+      [partnerId]
+    );
+    if (partnerCheck.rows.length === 0) {
+      return res.status(404).json({ error: "Partner not found" });
+    }
+
+    const result = await pool.query(
+      "INSERT INTO projects (name, partner_id) VALUES ($1, $2) RETURNING id, name, partner_id",
+      [name.trim(), partnerId]
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("Error creating project:", err);
+    res.status(500).json({ error: "Error creating project" });
+  }
+});
+
+//delete a project (admin only)
+app.delete("/projects/:id", authenticateToken, async (req, res) => {
+  console.log("🔴 DELETE PROJECT ROUTE HIT");
+  console.log("Project ID to delete:", req.params.id);
+  console.log("User:", req.user?.username, "Role:", req.user?.role);
+
+  if (req.user.role !== "admin") {
+    return res.status(403).json({ error: "Only admin can delete projects" });
+  }
+
+  const { id } = req.params;
+
+  try {
+    // Check if project has entries
+    const entryCheck = await pool.query(
+      "SELECT COUNT(*) as count FROM data_entries WHERE project_id = $1",
+      [id]
+    );
+
+    if (parseInt(entryCheck.rows[0].count) > 0) {
+      return res.status(400).json({
+        error:
+          "Cannot delete project with existing entries. Delete entries first or contact system administrator.",
+      });
+    }
+
+    // Delete the project
+    const result = await pool.query(
+      "DELETE FROM projects WHERE id = $1 RETURNING id, name, partner_id",
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Project not found" });
+    }
+
+    res.json({
+      message: "Project deleted successfully",
+      deleted: result.rows[0],
+    });
+  } catch (err) {
+    console.error("Error deleting project:", err);
+    res.status(500).json({ error: "Error deleting project" });
+  }
+});
+
 //--------------------------Entries Routes------------------------
 
-//user create entry
+//user create entry - with project id
 app.post("/entries", authenticateToken, async (req, res) => {
   if (req.user.role !== "user")
     return res.status(403).json({ error: "Access Denied" });
 
-  const { product, quantity, description, due_date } = req.body;
+  const { product, quantity, description, due_date, project_id } = req.body;
+
+  //validate project_id
+  if (!project_id) {
+    return res.status(400).json({ error: "Project ID is required" });
+  }
+
   try {
     await pool.query(
       `INSERT INTO data_entries 
-             (user_id, user_name, product, quantity, user_datetime, due_date, description)
-             VALUES ($1, $2, $3, $4, NOW(), $5, $6)`,
-      [req.user.id, req.user.username, product, quantity, due_date, description]
+             (user_id, user_name, product, quantity, user_datetime, due_date, description, project_id)
+             VALUES ($1, $2, $3, $4, NOW(), $5, $6, $7)`,
+      [
+        req.user.id,
+        req.user.username,
+        product,
+        quantity,
+        due_date,
+        description,
+        project_id,
+      ]
     );
     res.json({ message: "Entry created successfully" });
   } catch (err) {
@@ -128,79 +417,73 @@ app.post("/entries", authenticateToken, async (req, res) => {
   }
 });
 
-//office update entry
-// app.put("/entries/:id/office", authenticateToken, async (req, res) => {
+//get entries (role-based and project-specific)
+app.get("/entries/:projectId", authenticateToken, async (req, res) => {
+  const { projectId } = req.params;
 
-//   if (req.user.role !== "office")
-//         return res.status(403).json({error: "Access Denied"});
+  console.log("Fetching entries for project:", projectId);
+  console.log("User:", req.user.username, "Role:", req.user.role);
 
-//     const {status, delivery_date} = req.body;
-//     const entryId = parseInt(req.params.id);
-//     try {
-//         const result = await pool.query(
-//             `UPDATE data_entries
-//      SET office_id=$1, office_name=$2, office_datetime=NOW(), status=$3, delivery_date=$4, office_locked=TRUE, updated_at=NOW()
-//      WHERE id=$5 AND office_locked=FALSE
-//      RETURNING id, office_name, office_datetime, status, delivery_date, office_locked`,
-//             [req.user.id, req.user.username, status, delivery_date ? new Date(delivery_date) : null, entryId]
-//         );
-
-//         if (result.rowCount === 0)
-//             return res.status(400).json({error: "Entry is already loacked or does not exist"});
-
-//         res.json({message: "Entry updated by office", entry: result.rows[0]});
-//         alert("Entry updated by the Office");
-//     } catch (err) {
-//         console.log(err);
-//         res.status(500).json({error: "Server error"});
-//     }
-// });
+  try {
+    let result;
+    if (req.user.role === "admin" || req.user.role === "office") {
+      result = await pool.query(
+        "SELECT * FROM data_entries WHERE project_id=$1 ORDER BY id DESC",
+        [projectId]
+      );
+    } else if (req.user.role === "user") {
+      result = await pool.query(
+        "SELECT * FROM data_entries WHERE project_id=$1 AND user_id=$2 ORDER BY id DESC",
+        [projectId, req.user.id]
+      );
+    }
+    console.log("Entries found:", result.rows.length);
+    res.json(result.rows);
+  } catch (err) {
+    console.error("Error fetching entries:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
 
 //office --> step 1 - Order Form No ----------------------------
 app.put("/entries/:id/orderform", authenticateToken, async (req, res) => {
   if (req.user.role !== "office")
     return res.status(403).json({ error: "Access Denied" });
 
-  const { order_form_no } = req.body;
+  const { order_form_no, notes } = req.body;
   const entryId = parseInt(req.params.id);
 
   try {
+    console.log("Incoming request", {
+      order_form_no,
+      notes,
+      entryId,
+      user: req.user,
+    });
+
     const result = await pool.query(
       `UPDATE data_entries
-            SET order_form_no = $1, office_user_1 = $2, office_datetime_1 = NOW()
-            WHERE id = $3 RETURNING *`,
-      [order_form_no, req.user.username, entryId]
+            SET order_form_no = $1, notes = $2, office_user_1 = $3, office_datetime_1 = NOW()
+            WHERE id = $4 RETURNING *`,
+      [order_form_no, notes || null, req.user.username, entryId]
     );
 
+    console.log("update success", result.rows[0]);
+    res.json(result.rows[0]);
+
     if (result.rowCount === 0) {
+      console.log("no entry found ", entryId);
       return res.status(404).json({ error: "Entry not found" });
     }
 
     // Return just the entry object, not nested in a message
+    console.log("update success", result.rows[0]);
     res.json(result.rows[0]);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
   }
 });
-// app.put("/entries/:id/orderform", authenticateToken, async (req, res) => {
-//   if (req.user.role !== "office") return res.status(403).json({error: "Access Denied"});
-
-//   const {order_form_no} = req.body;
-//   const entryId = parseInt(req.params.id);
-//   try{
-//     const result = await pool.query(
-//       `UPDATE data_entries
-//       SET order_form_no= $1, office_user_1=$2, office_datetime_1=NOW()
-//       WHERE id=$3 RETURNING *`,
-//       [order_form_no, req.user.username, entryId]
-//     );
-//     res.json({message: "Order Form No added", entry: result.rows[0] });
-//   } catch (err) {
-//     console.error(err);
-//     res.status(500).json({error: "server error"});
-//   }
-// });
 
 //ADMIN --> step 2 - Approve ----------------------------------
 app.put("/entries/:id/approve", authenticateToken, async (req, res) => {
@@ -226,124 +509,6 @@ app.put("/entries/:id/approve", authenticateToken, async (req, res) => {
     res.status(500).json({ error: "Server error approving entry" });
   }
 });
-// app.put("/entries/:id/approve", authenticateToken, async (req, res) => {
-//   console.log("=== APPROVE ROUTE HIT ===");
-//   console.log("User role:", req.user.role);
-//   console.log("Entry ID:", req.params.id);
-//   console.log("Request body:", req.body);
-
-//   try {
-//     // Simple role check
-//     if (req.user.role !== "admin") {
-//       console.log("Access denied - not admin");
-//       return res.status(403).json({error: "Access Denied"});
-//     }
-
-//     const entryId = parseInt(req.params.id);
-//     console.log("Parsed entry ID:", entryId);
-
-//     // Just try to update - no fancy checks
-//     const result = await pool.query(
-//       "UPDATE data_entries SET approved = true WHERE id = $1 RETURNING *",
-//       [entryId]
-//     );
-
-//     console.log("Query executed, rows affected:", result.rowCount);
-
-//     if (result.rowCount === 0) {
-//       console.log("No rows updated");
-//       return res.status(404).json({ error: "Entry not found" });
-//     }
-
-//     console.log("Success! Returning:", result.rows[0]);
-//     res.json(result.rows[0]);
-
-//   } catch (err) {
-//     console.error("=== ERROR IN APPROVE ROUTE ===");
-//     console.error("Error message:", err.message);
-//     console.error("Error code:", err.code);
-//     console.error("Error detail:", err.detail);
-//     console.error("Full error:", err);
-//     res.status(500).json({
-//       error: "Server error approving entry",
-//       details: err.message,
-//       code: err.code
-//     });
-//   }
-// });
-
-// app.put("/entries/:id/approve", authenticateToken, async (req, res) => {
-
-//   console.log("Approve route hit - user role", req.user.role);
-//   console.log("request params", req.params);
-//   console.log("request body", req.body);
-
-//   if (req.user.role !== "admin") return res.status(403).json({error: "Access Denied"});
-// try {
-//    const {entryId} = parseInt(req.params.id);
-//   const {approved} = req.body;
-
-//   //first check if entry ecists and has order_form_no
-//   const checkResult = await pool.query(
-//     "SELECT * FROM data_entries WHERE id = $1",
-//     [entryId]
-//   );
-
-//   if (checkResult.rows.length === 0){
-//     return res.status(404).json({error: "Entry not found"});
-//   }
-
-//   const entry = checkResult.rows[0];
-
-//   if (!entry.order_form_no){
-//     return res.status(400).json({error: "Cannot approve: order form no missing"});
-//   }
-
-//   // update the entry
-//   const result = await pool.query(
-//     `UPDATE data_entries
-//     SET approved = $1, updated_at = NOW()
-//     WHERE id = $2
-//     RETURNING *`,
-//     [approved, entryId]
-//   );
-//   console.log("updated successfu;, rows affected:", result.rowCount)
-//   res.json(result.rows[0]);
-// }
-// catch (err){
-//   console.error("error in approve route", err.message);
-//   console.error("full error", err);
-//   res.status(500).json({error: "Server error approving entry"});
-// }
-//   // const entry = await Entry.findByPk(id);
-//   // if(!entry) return res.status(404).json({error: "Entry not found"});
-
-//   // if(!entry.order_form_no){
-//   //   return res.status(400).json({error: "Cannot approve: Order Form no missing"});
-//   // }
-// //   entry.approved = approved;
-// //   await entry.save();
-
-// //   res.json(entry) //return updated entry
-// // } catch (err) {
-// //    console.error(err);
-// //     res.status(500).json({ error: "Server error approving entry" });
-// // }
-
-//   // try {
-//   //   const result = await pool.query(
-//   //     `UPDATE data_entries
-//   //     SET approved=TRUE
-//   //     WHERE id=$2 RETURNING *`,
-//   //     [entryId]
-//   //   );
-//   //   res.json({message: "Entry Approved", entry: result.rows[0] });
-//   // }
-//   // catch (err) {
-//   //   console.error(err);
-//   //   res.status(500).json({error: "Server error"});
-//   // }
-// });
 
 //Office --> step 3 - PO no -----------------------------------
 app.put("/entries/:id/po", authenticateToken, async (req, res) => {
@@ -374,6 +539,7 @@ app.put("/entries/:id/po", authenticateToken, async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
+
 // app.put("/entries/:id/po", authenticateToken, async (req, res) =>{
 //   if (req.user.role !== "office") return res.status(403).json({error: "Access Denied"});
 
@@ -433,19 +599,21 @@ app.put("/entries/:id/driver", authenticateToken, async (req, res) => {
   if (req.user.role !== "office")
     return res.status(403).json({ error: "Access Denied" });
 
-  const { purchase_date } = req.body;
+  const { purchase_date, drivers_name, vehicle_no, driver_description } =
+    req.body;
   const entryId = parseInt(req.params.id);
 
   try {
     // Simple update and return everything
     await pool.query(
       `UPDATE data_entries
-            SET purchase_date = $1, drivers_name = $2, vehicle_no = $3, received = NOW(), driver_description = $4
-            WHERE id = $5`,
+            SET purchase_date = $1, drivers_name = $2, vehicle_no = $3, received = $4, driver_description = $5
+            WHERE id = $6`,
       [
         purchase_date,
         drivers_name || null,
         vehicle_no || null,
+        received || null,
         driver_description || null,
         entryId,
       ]
@@ -463,30 +631,6 @@ app.put("/entries/:id/driver", authenticateToken, async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
-
-// app.put("/entries/:id/invoice", authenticateToken, async (req, res) => {
-//   if(req.user.role !== "office") return res.status(403).json({error: "Access Denied"});
-
-//   const {invoice_no} = req.body;
-//   const entryId = parseInt(req.params.id);
-//   console.log("Invoice update request:", req.body, "Entry ID:", entryId)
-//   try {
-//     const result = await pool.query(
-//       `UPDATE data_entries
-//       SET invoice_no=$1, office_user_3=$2, invoice_datetime=NOW()
-//       WHERE id=$3 AND po_no IS NOT NULL RETURNING *`,
-//       [invoice_no, req.user.username, entryId]
-//     );
-
-//     if (result.rowCount === 0){
-//       return res.status(400).json({error: "PO number is not added yet"})
-//     }
-//     res.json({ message: "Invoice No added", entry: result.rows[0] });
-//   } catch (err) {
-//     console.error(err);
-//     res.status(500).json({ error: "Server error" });
-//   }
-// })
 
 //Admin update entry
 app.put("/entries/:id/admin", authenticateToken, async (req, res) => {
