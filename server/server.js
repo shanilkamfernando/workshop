@@ -153,46 +153,6 @@ app.post("/login", async (req, res) => {
   }
 });
 
-//create partner
-app.post(
-  "/partners",
-  authenticateToken,
-  upload.single("image"),
-  async (req, res) => {
-    console.log("Create partner request received");
-    console.log("Body", req.body);
-    console.log("File:", req.file);
-
-    if (req.user.role !== "admin") {
-      return res.status(403).json({ error: "Only admin can create partners" });
-    }
-
-    const { name } = req.body;
-    if (!name || !name.trim()) {
-      return res.status(400).json({ error: "Partner name is required" });
-    }
-
-    try {
-      const imageUrl = req.file
-        ? `/uploads/partners/${req.file.filename}`
-        : null;
-
-      const result = await pool.query(
-        "INSERT INTO partners (name, image_url) VALUES ($1, $2) RETURNING id, name, image_url",
-        [name.trim(), imageUrl]
-      );
-
-      console.log("Partner Created", result.rows[0]);
-      res.json(result.rows[0]);
-    } catch (err) {
-      console.error("Error creating partner:", err);
-      res
-        .status(500)
-        .json({ error: "Error creating partner", details: err.message });
-    }
-  }
-);
-
 //delete a partner (admin only)
 app.delete("/partners/:id", authenticateToken, async (req, res) => {
   if (req.user.role !== "admin") {
@@ -233,6 +193,326 @@ app.delete("/partners/:id", authenticateToken, async (req, res) => {
   }
 });
 
+app.get("/partners/status/all", authenticateToken, async (req, res) => {
+  // Only admin can see notifications
+  if (req.user.role !== "admin") {
+    return res.status(403).json({ error: "Access Denied - Admin only" });
+  }
+
+  try {
+    const result = await pool.query(
+      "SELECT id, name FROM partners ORDER BY id"
+    );
+
+    // For each partner, count pending entries across all projects
+    const partnersWithStatus = await Promise.all(
+      result.rows.map(async (partner) => {
+        const countResult = await pool.query(
+          `SELECT 
+            COUNT(*) FILTER (WHERE order_form_no IS NULL AND user_id IS NOT NULL) as new_entries,
+            COUNT(*) FILTER (WHERE order_form_no IS NOT NULL AND approved IS FALSE) as pending_approval,
+            COUNT(*) FILTER (WHERE approved IS TRUE AND po_no IS NULL) as approved_pending_po,
+            COUNT(*) FILTER (WHERE po_no IS NOT NULL AND invoice_no IS NULL) as pending_invoice,
+            COUNT(*) FILTER (WHERE invoice_no IS NOT NULL AND driver_description IS NULL) as pending_driver
+          FROM data_entries de
+          JOIN projects p ON de.project_id = p.id
+          WHERE p.partner_id = $1`,
+          [partner.id]
+        );
+
+        const counts = countResult.rows[0];
+        const totalPending =
+          parseInt(counts.new_entries) +
+          parseInt(counts.pending_approval) +
+          parseInt(counts.approved_pending_po) +
+          parseInt(counts.pending_invoice) +
+          parseInt(counts.pending_driver);
+
+        let notificationColor = null;
+
+        if (counts.new_entries > 0) {
+          notificationColor = "red";
+        } else if (counts.pending_approval > 0) {
+          notificationColor = "yellow";
+        } else if (counts.approved_pending_po > 0) {
+          notificationColor = "green";
+        } else if (counts.pending_invoice > 0) {
+          notificationColor = "orange";
+        } else if (counts.pending_driver > 0) {
+          notificationColor = "gray";
+        }
+
+        return {
+          ...partner,
+          notificationColor,
+          totalPending,
+          counts: {
+            newEntries: parseInt(counts.new_entries),
+            pendingApproval: parseInt(counts.pending_approval),
+            approvedPendingPo: parseInt(counts.approved_pending_po),
+            pendingInvoice: parseInt(counts.pending_invoice),
+            pendingDriver: parseInt(counts.pending_driver),
+          },
+        };
+      })
+    );
+
+    res.json(partnersWithStatus);
+  } catch (err) {
+    console.error("Error fetching partners with status:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Add this new endpoint for office users to see partner status
+app.get("/partners/status/office", authenticateToken, async (req, res) => {
+  // Only office and admin can see notifications
+  if (req.user.role !== "office" && req.user.role !== "admin") {
+    return res.status(403).json({ error: "Access Denied" });
+  }
+
+  try {
+    const result = await pool.query(
+      "SELECT id, name FROM partners ORDER BY id"
+    );
+
+    // For each partner, count pending entries that office needs to handle
+    const partnersWithStatus = await Promise.all(
+      result.rows.map(async (partner) => {
+        const countResult = await pool.query(
+          `SELECT 
+            COUNT(*) FILTER (WHERE order_form_no IS NULL AND user_id IS NOT NULL) as new_entries,
+            COUNT(*) FILTER (WHERE approved IS TRUE AND po_no IS NULL) as approved_pending_po,
+            COUNT(*) FILTER (WHERE po_no IS NOT NULL AND invoice_no IS NULL) as pending_invoice,
+            COUNT(*) FILTER (WHERE invoice_no IS NOT NULL AND driver_description IS NULL) as pending_driver
+          FROM data_entries de
+          JOIN projects p ON de.project_id = p.id
+          WHERE p.partner_id = $1`,
+          [partner.id]
+        );
+
+        const counts = countResult.rows[0];
+        const totalPending =
+          parseInt(counts.new_entries) +
+          parseInt(counts.approved_pending_po) +
+          parseInt(counts.pending_invoice) +
+          parseInt(counts.pending_driver);
+
+        let notificationColor = null;
+
+        // Priority order for office users
+        if (counts.new_entries > 0) {
+          notificationColor = "red"; // New entries need Order Form No
+        } else if (counts.approved_pending_po > 0) {
+          notificationColor = "green"; // Approved entries need PO
+        } else if (counts.pending_invoice > 0) {
+          notificationColor = "orange"; // PO added, need Invoice
+        } else if (counts.pending_driver > 0) {
+          notificationColor = "gray"; // Invoice added, need Driver details
+        }
+
+        return {
+          ...partner,
+          notificationColor,
+          totalPending,
+          counts: {
+            newEntries: parseInt(counts.new_entries),
+            approvedPendingPo: parseInt(counts.approved_pending_po),
+            pendingInvoice: parseInt(counts.pending_invoice),
+            pendingDriver: parseInt(counts.pending_driver),
+          },
+        };
+      })
+    );
+
+    res.json(partnersWithStatus);
+  } catch (err) {
+    console.error("Error fetching partners with status for office:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Get project status with notification indicators
+app.get("/projects/:partnerId/status", authenticateToken, async (req, res) => {
+  const { partnerId } = req.params;
+
+  try {
+    const projectsResult = await pool.query(
+      "SELECT id, name, partner_id FROM projects WHERE partner_id = $1 ORDER BY id",
+      [partnerId]
+    );
+
+    const projectsWithStatus = await Promise.all(
+      projectsResult.rows.map(async (project) => {
+        const entriesResult = await pool.query(
+          `SELECT 
+            COUNT(*) FILTER (WHERE order_form_no IS NULL AND user_id IS NOT NULL) as new_entries,
+            COUNT(*) FILTER (WHERE order_form_no IS NOT NULL AND approved IS FALSE) as pending_approval,
+            COUNT(*) FILTER (WHERE approved IS TRUE AND po_no IS NULL) as approved_pending_po,
+            COUNT(*) FILTER (WHERE po_no IS NOT NULL AND invoice_no IS NULL) as pending_invoice,
+            COUNT(*) FILTER (WHERE invoice_no IS NOT NULL AND driver_description IS NULL) as pending_driver
+          FROM data_entries 
+          WHERE project_id = $1`,
+          [project.id]
+        );
+
+        const counts = entriesResult.rows[0];
+        const totalPending =
+          parseInt(counts.new_entries) +
+          parseInt(counts.pending_approval) +
+          parseInt(counts.approved_pending_po) +
+          parseInt(counts.pending_invoice) +
+          parseInt(counts.pending_driver);
+
+        let notificationColor = null;
+
+        if (counts.new_entries > 0) {
+          notificationColor = "red";
+        } else if (counts.pending_approval > 0) {
+          notificationColor = "yellow";
+        } else if (counts.approved_pending_po > 0) {
+          notificationColor = "green";
+        } else if (counts.pending_invoice > 0) {
+          notificationColor = "orange";
+        } else if (counts.pending_driver > 0) {
+          notificationColor = "gray";
+        }
+
+        return {
+          ...project,
+          notificationColor,
+          totalPending,
+          counts: {
+            newEntries: parseInt(counts.new_entries),
+            pendingApproval: parseInt(counts.pending_approval),
+            approvedPendingPo: parseInt(counts.approved_pending_po),
+            pendingInvoice: parseInt(counts.pending_invoice),
+            pendingDriver: parseInt(counts.pending_driver),
+          },
+        };
+      })
+    );
+
+    res.json(projectsWithStatus);
+  } catch (err) {
+    console.error("Error fetching project status:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Add this new endpoint for office users to see project status
+app.get(
+  "/projects/:partnerId/status/office",
+  authenticateToken,
+  async (req, res) => {
+    const { partnerId } = req.params;
+
+    // Only office and admin can see notifications
+    if (req.user.role !== "office" && req.user.role !== "admin") {
+      return res.status(403).json({ error: "Access Denied" });
+    }
+
+    try {
+      const projectsResult = await pool.query(
+        "SELECT id, name, partner_id FROM projects WHERE partner_id = $1 ORDER BY id",
+        [partnerId]
+      );
+
+      const projectsWithStatus = await Promise.all(
+        projectsResult.rows.map(async (project) => {
+          const entriesResult = await pool.query(
+            `SELECT 
+            COUNT(*) FILTER (WHERE order_form_no IS NULL AND user_id IS NOT NULL) as new_entries,
+            COUNT(*) FILTER (WHERE approved IS TRUE AND po_no IS NULL) as approved_pending_po,
+            COUNT(*) FILTER (WHERE po_no IS NOT NULL AND invoice_no IS NULL) as pending_invoice,
+            COUNT(*) FILTER (WHERE invoice_no IS NOT NULL AND driver_description IS NULL) as pending_driver
+          FROM data_entries 
+          WHERE project_id = $1`,
+            [project.id]
+          );
+
+          const counts = entriesResult.rows[0];
+          const totalPending =
+            parseInt(counts.new_entries) +
+            parseInt(counts.approved_pending_po) +
+            parseInt(counts.pending_invoice) +
+            parseInt(counts.pending_driver);
+
+          let notificationColor = null;
+
+          // Priority order for office users
+          if (counts.new_entries > 0) {
+            notificationColor = "red";
+          } else if (counts.approved_pending_po > 0) {
+            notificationColor = "green";
+          } else if (counts.pending_invoice > 0) {
+            notificationColor = "orange";
+          } else if (counts.pending_driver > 0) {
+            notificationColor = "gray";
+          }
+
+          return {
+            ...project,
+            notificationColor,
+            totalPending,
+            counts: {
+              newEntries: parseInt(counts.new_entries),
+              approvedPendingPo: parseInt(counts.approved_pending_po),
+              pendingInvoice: parseInt(counts.pending_invoice),
+              pendingDriver: parseInt(counts.pending_driver),
+            },
+          };
+        })
+      );
+
+      res.json(projectsWithStatus);
+    } catch (err) {
+      console.error("Error fetching project status for office:", err);
+      res.status(500).json({ error: "Server error" });
+    }
+  }
+);
+
+//create partner
+app.post(
+  "/partners",
+  authenticateToken,
+  upload.single("image"),
+  async (req, res) => {
+    console.log("Create partner request received");
+    console.log("Body", req.body);
+    console.log("File:", req.file);
+
+    if (req.user.role !== "admin") {
+      return res.status(403).json({ error: "Only admin can create partners" });
+    }
+
+    const { name } = req.body;
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: "Partner name is required" });
+    }
+
+    try {
+      const imageUrl = req.file
+        ? `/uploads/partners/${req.file.filename}`
+        : null;
+
+      const result = await pool.query(
+        "INSERT INTO partners (name, image_url) VALUES ($1, $2) RETURNING id, name, image_url",
+        [name.trim(), imageUrl]
+      );
+
+      console.log("Partner Created", result.rows[0]);
+      res.json(result.rows[0]);
+    } catch (err) {
+      console.error("Error creating partner:", err);
+      res
+        .status(500)
+        .json({ error: "Error creating partner", details: err.message });
+    }
+  }
+);
+
 //get all the partners
 app.get("/partners", authenticateToken, async (req, res) => {
   try {
@@ -243,32 +523,6 @@ app.get("/partners", authenticateToken, async (req, res) => {
   } catch (err) {
     console.error("Error fetching partners:", err);
     res.status(500).json({ error: "Error getting partners" });
-  }
-});
-
-//Optional ----> Get project info
-app.get("/projects/info/:projectId", authenticateToken, async (req, res) => {
-  const { projectId } = req.params;
-
-  console.log("Fetching project info for:", projectId);
-
-  try {
-    const result = await pool.query(
-      `SELECT p.id, p.name, p.partner_id, pa.name as partner_name
-       FROM projects p
-       JOIN partners pa ON p.partner_id = pa.id
-       WHERE p.id = $1`,
-      [projectId]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Project not found" });
-    }
-
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error("Error fetching project info:", err);
-    res.status(500).json({ error: "Server error" });
   }
 });
 
@@ -297,6 +551,32 @@ app.get("/projects/:partnerId", authenticateToken, async (req, res) => {
     res
       .status(500)
       .json({ error: "Error getting projects", details: err.message });
+  }
+});
+
+//Optional ----> Get project info
+app.get("/projects/info/:projectId", authenticateToken, async (req, res) => {
+  const { projectId } = req.params;
+
+  console.log("Fetching project info for:", projectId);
+
+  try {
+    const result = await pool.query(
+      `SELECT p.id, p.name, p.partner_id, pa.name as partner_name
+       FROM projects p
+       JOIN partners pa ON p.partner_id = pa.id
+       WHERE p.id = $1`,
+      [projectId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Project not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("Error fetching project info:", err);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
@@ -599,8 +879,13 @@ app.put("/entries/:id/driver", authenticateToken, async (req, res) => {
   if (req.user.role !== "office")
     return res.status(403).json({ error: "Access Denied" });
 
-  const { purchase_date, drivers_name, vehicle_no, driver_description } =
-    req.body;
+  const {
+    purchase_date,
+    drivers_name,
+    vehicle_no,
+    received,
+    driver_description,
+  } = req.body;
   const entryId = parseInt(req.params.id);
 
   try {
