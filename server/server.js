@@ -300,7 +300,7 @@ app.get("/partners/status/office", authenticateToken, async (req, res) => {
 
         let notificationColor = null;
 
-        // Priority order for office users
+        // Priority order for office users (no yellow for approval)
         if (counts.new_entries > 0) {
           notificationColor = "red"; // New entries need Order Form No
         } else if (counts.approved_pending_po > 0) {
