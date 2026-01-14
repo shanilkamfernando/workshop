@@ -1,0 +1,11 @@
+{
+  "devDependencies": {
+    "autoprefixer": "^10.4.21",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^4.1.14"
+  },
+  "dependencies": {
+    "lucide-react": "^0.553.0",
+    "multer": "^2.0.2"
+  }
+}
